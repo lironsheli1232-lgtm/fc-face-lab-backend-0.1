@@ -12,31 +12,112 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY
 });
 
+const ANALYSIS_MODEL = "gemini-3.8-flash";
+const IMAGE_MODEL = "gemini-3.1-flash-image";
+
+
+// --------------------------------------------------
+// Retry helper
+// --------------------------------------------------
+
+async function withRetry(fn, attempts = 4) {
+
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+
+    try {
+
+      return await fn();
+
+    } catch (error) {
+
+      lastError = error;
+
+      const status =
+        error?.status ||
+        error?.code ||
+        error?.response?.status;
+
+      const message =
+        error?.message || "";
+
+      const isTemporary =
+        status === 503 ||
+        status === 429 ||
+        message.includes("high demand") ||
+        message.includes("UNAVAILABLE") ||
+        message.includes("overloaded") ||
+        message.includes("RESOURCE_EXHAUSTED");
+
+      if (!isTemporary || attempt === attempts) {
+        throw error;
+      }
+
+      const waitTime =
+        attempt === 1 ? 2500 :
+        attempt === 2 ? 5000 :
+        9000;
+
+      console.log(
+        `Gemini temporarily unavailable. Retry ${attempt + 1}/${attempts} in ${waitTime}ms`
+      );
+
+      await new Promise(resolve =>
+        setTimeout(resolve, waitTime)
+      );
+    }
+  }
+
+  throw lastError;
+}
+
+
+// --------------------------------------------------
+// Home
+// --------------------------------------------------
+
 app.get("/", (req, res) => {
+
   res.json({
     ok: true,
     service: "FC FACE LAB",
     message: "Backend is running"
   });
+
 });
 
+
+// --------------------------------------------------
+// Face analysis
+// --------------------------------------------------
+
 app.post("/analyze", async (req, res) => {
+
   try {
+
     if (!process.env.GEMINI_API_KEY) {
+
       return res.status(500).json({
         success: false,
         error: "GEMINI_API_KEY is missing"
       });
+
     }
+
 
     const { image, mimeType } = req.body;
 
+
     if (!image || !mimeType) {
+
       return res.status(400).json({
         success: false,
         error: "Image is missing"
       });
+
     }
+
 
     const analysisPrompt = `
 Analyze the person's face in the supplied photograph.
@@ -101,29 +182,46 @@ Return ONLY valid JSON using exactly this structure:
 }
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
 
-      contents: [
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: image
+    // --------------------------------------------------
+    // Gemini analysis with automatic retry
+    // --------------------------------------------------
+
+    const response = await withRetry(
+      () =>
+        ai.models.generateContent({
+
+          model: ANALYSIS_MODEL,
+
+          contents: [
+
+            {
+              inlineData: {
+                mimeType: mimeType,
+                data: image
+              }
+            },
+
+            {
+              text: analysisPrompt
+            }
+
+          ],
+
+          config: {
+            responseMimeType: "application/json"
           }
-        },
-        {
-          text: analysisPrompt
-        }
-      ],
 
-      config: {
-        responseMimeType: "application/json"
-      }
-    });
+        }),
+      4
+    );
+
 
     let analysis;
 
+
     try {
+
       const responseText =
         typeof response.text === "string"
           ? response.text
@@ -133,31 +231,45 @@ Return ONLY valid JSON using exactly this structure:
 
     } catch (error) {
 
-      console.error("JSON parse error:", error);
+      console.error(
+        "JSON parse error:",
+        error
+      );
 
       return res.status(500).json({
         success: false,
         error: "Gemini returned invalid JSON"
       });
+
     }
+
+
+    // --------------------------------------------------
+    // AI visual simulation
+    // --------------------------------------------------
 
     let simulationImage = null;
 
+
     try {
 
-      const imageResponse = await ai.models.generateContent({
+      const imageResponse = await withRetry(
+        () =>
+          ai.models.generateContent({
 
-        model: "gemini-3.1-flash-image",
+            model: IMAGE_MODEL,
 
-        contents: [
-          {
-            inlineData: {
-              mimeType: mimeType,
-              data: image
-            }
-          },
-          {
-            text: `
+            contents: [
+
+              {
+                inlineData: {
+                  mimeType: mimeType,
+                  data: image
+                }
+              },
+
+              {
+                text: `
 Create a realistic football video-game Create-A-Player
 visualization based on the supplied person's photograph.
 
@@ -192,17 +304,25 @@ Do not add logos.
 Do not add football shirts.
 Do not change the person's fundamental facial characteristics.
 `
-          }
-        ],
+              }
 
-        config: {
-          responseModalities: ["IMAGE"]
-        }
+            ],
 
-      });
+            config: {
+              responseModalities: ["IMAGE"]
+            }
+
+          }),
+        3
+      );
+
 
       const parts =
-        imageResponse.candidates?.[0]?.content?.parts || [];
+        imageResponse
+          ?.candidates?.[0]
+          ?.content
+          ?.parts || [];
+
 
       const imagePart =
         parts.find(
@@ -210,6 +330,7 @@ Do not change the person's fundamental facial characteristics.
             part.inlineData &&
             part.inlineData.data
         );
+
 
       if (imagePart) {
 
@@ -225,13 +346,26 @@ Do not change the person's fundamental facial characteristics.
         imageError
       );
 
+      // The face analysis itself can still succeed
+      // even if the visual simulation fails.
+
     }
 
+
+    // --------------------------------------------------
+    // Final response
+    // --------------------------------------------------
+
     return res.json({
+
       success: true,
+
       analysis: analysis,
+
       simulationImage: simulationImage
+
     });
+
 
   } catch (error) {
 
@@ -240,14 +374,44 @@ Do not change the person's fundamental facial characteristics.
       error
     );
 
+
+    const status =
+      error?.status ||
+      error?.code;
+
+
+    if (status === 503 || status === 429) {
+
+      return res.status(503).json({
+
+        success: false,
+
+        error:
+          "Gemini is temporarily busy. The server tried several times automatically. Please try again in a moment."
+
+      });
+
+    }
+
+
     return res.status(500).json({
+
       success: false,
+
       error:
         error?.message ||
         "Gemini request failed"
+
     });
+
   }
+
 });
+
+
+// --------------------------------------------------
+// Start server
+// --------------------------------------------------
 
 app.listen(PORT, () => {
 
